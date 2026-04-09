@@ -177,17 +177,17 @@ def _get_applicant(platform: str, browser, profile, resume_text, resume_pdf, job
     from agent1.platforms.greenhouse import GreenhouseApplicant
     from agent1.platforms.lever import LeverApplicant
     from agent1.platforms.ashby import AshbyApplicant
+    from agent1.platforms.workday import WorkdayApplicant
+    from agent1.platforms.unknown import UnknownApplicant
 
     PLATFORM_MAP = {
         "greenhouse": GreenhouseApplicant,
         "lever": LeverApplicant,
         "ashby": AshbyApplicant,
+        "workday": WorkdayApplicant,
     }
 
-    cls = PLATFORM_MAP.get(platform)
-    if cls is None:
-        return None
-
+    cls = PLATFORM_MAP.get(platform, UnknownApplicant)
     return cls(browser, profile, resume_text, resume_pdf, job)
 
 
@@ -237,18 +237,7 @@ def run_job(job: dict, worker_id: int = 0,
         resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
     resume_pdf = str(config.RESUME_PDF_PATH)
 
-    # 3. Check if we have a script for this platform
-    applicant_cls_available = platform in ("greenhouse", "lever", "ashby")
-
-    if not applicant_cls_available:
-        elapsed = int(time.time() - start)
-        add_event(f"[W{worker_id}] SKIP ({elapsed}s): no script for '{platform}'")
-        update_state(worker_id, status="failed",
-                     last_action=f"no script: {platform}")
-        duration_ms = int((time.time() - start) * 1000)
-        return f"failed:unsupported_platform:{platform}", duration_ms
-
-    # 4. Launch browser and run platform script
+    # 3. Launch browser and run platform script
     from agent1.browser import Browser
 
     update_state(worker_id, status="applying", last_action="launching browser")
