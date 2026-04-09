@@ -175,10 +175,13 @@ def _is_permanent_failure(result: str) -> bool:
 def _get_applicant(platform: str, browser, profile, resume_text, resume_pdf, job):
     """Return the correct platform applicant based on ATS detection."""
     from agent1.platforms.greenhouse import GreenhouseApplicant
-    # Future: import LeverApplicant, WorkdayApplicant, etc.
+    from agent1.platforms.lever import LeverApplicant
+    from agent1.platforms.ashby import AshbyApplicant
 
     PLATFORM_MAP = {
         "greenhouse": GreenhouseApplicant,
+        "lever": LeverApplicant,
+        "ashby": AshbyApplicant,
     }
 
     cls = PLATFORM_MAP.get(platform)
@@ -235,7 +238,7 @@ def run_job(job: dict, worker_id: int = 0,
     resume_pdf = str(config.RESUME_PDF_PATH)
 
     # 3. Check if we have a script for this platform
-    applicant_cls_available = platform in ("greenhouse",)  # Add more as built
+    applicant_cls_available = platform in ("greenhouse", "lever", "ashby")
 
     if not applicant_cls_available:
         elapsed = int(time.time() - start)
