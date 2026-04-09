@@ -235,7 +235,15 @@ def run_job(job: dict, worker_id: int = 0,
     resume_text = ""
     if config.RESUME_PATH.exists():
         resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
-    resume_pdf = str(config.RESUME_PDF_PATH)
+
+    # Copy resume to a Windows-accessible path (Chrome on Windows can't read WSL Linux paths)
+    import shutil
+    upload_dir = Path("/mnt/d/agent1/.uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    name_slug = profile.get("personal", {}).get("full_name", "resume").replace(" ", "_")
+    resume_pdf = str(upload_dir / f"{name_slug}_Resume.pdf")
+    if config.RESUME_PDF_PATH.exists():
+        shutil.copy2(str(config.RESUME_PDF_PATH), resume_pdf)
 
     # 3. Launch browser and run platform script
     from agent1.browser import Browser

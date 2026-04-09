@@ -88,9 +88,22 @@ class GreenhouseApplicant(PlatformApplicant):
         self._try_fill('#email', self.email)
         self._try_fill('input[name="job_application[email]"]', self.email)
 
-        # Phone
-        self._try_fill('#phone', self.phone)
-        self._try_fill('input[name="job_application[phone]"]', self.phone)
+        # Phone — handle country code dropdown first
+        phone_country = b.query('select[id*="phone_country"], select[name*="phone_country"]')
+        if phone_country:
+            try:
+                # Select US (+1)
+                phone_country.select_option(label="United States (+1)")
+            except Exception:
+                try:
+                    phone_country.select_option(value="us")
+                except Exception:
+                    pass
+
+        # Phone number (digits only if there's a country code prefix)
+        phone_val = self.phone_digits if phone_country else self.phone
+        self._try_fill('#phone', phone_val)
+        self._try_fill('input[name="job_application[phone]"]', phone_val)
 
     def _upload_resume(self) -> None:
         """Upload resume PDF. Greenhouse uses a file input near 'Resume'."""
@@ -143,63 +156,158 @@ class GreenhouseApplicant(PlatformApplicant):
                 break
 
     def _handle_custom_questions(self) -> None:
-        """Find and answer custom screening questions.
+        """Find and answer ALL form fields — selects, radios, text, textarea.
 
-        Greenhouse renders custom questions as form fields with labels.
-        Standard fields (name, email, etc.) are excluded by checking IDs.
+        Uses a comprehensive approach: find every unfilled select, textarea,
+        text input, and radio group on the page, match to profile or AI.
         """
         b = self.b
 
-        # Find all question containers — Greenhouse uses .field or .application-field
-        containers = b.query_all('.field, .application-field, [data-field]')
+        # 1. Handle ALL select dropdowns on the page
+        self._fill_all_selects()
 
-        standard_ids = {
+        # 2. Handle remaining text/textarea/radio/checkbox fields
+        self._fill_remaining_fields()
+
+    def _fill_all_selects(self) -> None:
+        """Fill every unfilled <select> dropdown on the page."""
+        b = self.b
+
+        selects_info = b.evaluate('''() => {
+            return Array.from(document.querySelectorAll('select')).map((sel, idx) => {
+                if (sel.value) return null;  // Already filled
+                let label = '';
+                const container = sel.closest('.field, [class*=field], [class*=question]');
+                if (container) {
+                    const lbl = container.querySelector('label');
+                    if (lbl) label = lbl.textContent.trim();
+                }
+                if (!label) label = sel.getAttribute('aria-label') || '';
+                const opts = Array.from(sel.options)
+                    .filter(o => o.value && o.value !== '')
+                    .map(o => ({ value: o.value, text: o.textContent.trim() }));
+                return { index: idx, label, options: opts, name: sel.name || '', id: sel.id || '' };
+            }).filter(x => x !== null);
+        }''')
+
+        for info in selects_info:
+            label = info.get("label", "")
+            options = info.get("options", [])
+            opt_texts = [o["text"] for o in options]
+
+            if not opt_texts:
+                continue
+
+            # Try profile-based answer
+            answer = self._profile_answer_for_select(label, opt_texts)
+
+            if not answer:
+                # Try AI
+                try:
+                    answer = self._answer_screening(label, opt_texts)
+                except Exception:
+                    answer = opt_texts[0] if opt_texts else ""
+
+            if not answer:
+                continue
+
+            # Find matching option value and select it
+            target_value = None
+            answer_lower = answer.lower().strip()
+            for o in options:
+                if o["text"].strip() == answer.strip():
+                    target_value = o["value"]
+                    break
+            if not target_value:
+                for o in options:
+                    if answer_lower in o["text"].lower():
+                        target_value = o["value"]
+                        break
+            if not target_value and options:
+                # Last resort: first non-empty option
+                target_value = options[0]["value"]
+
+            if target_value:
+                try:
+                    sel_selector = ""
+                    if info.get("id"):
+                        sel_selector = f'#{info["id"]}'
+                    elif info.get("name"):
+                        sel_selector = f'select[name="{info["name"]}"]'
+                    else:
+                        sel_selector = f'select >> nth={info["index"]}'
+
+                    b.page.select_option(sel_selector, target_value)
+                    logger.debug("Selected '%s' for '%s'", answer, label[:40])
+                except Exception as e:
+                    logger.debug("Failed to select for '%s': %s", label[:40], e)
+
+    def _fill_remaining_fields(self) -> None:
+        """Fill unfilled text inputs, textareas, radios, and checkboxes."""
+        b = self.b
+
+        standard_names = {
             'first_name', 'last_name', 'email', 'phone',
-            'resume', 'cover_letter', 'linkedin', 'website',
+            'job_application[first_name]', 'job_application[last_name]',
+            'job_application[email]', 'job_application[phone]',
         }
 
-        for container in containers:
-            try:
-                # Get the label text
-                label_el = container.query_selector('label')
-                if not label_el:
-                    continue
-                label = label_el.text_content().strip()
-                if not label:
-                    continue
+        # Text inputs and textareas
+        fields = b.evaluate('''() => {
+            return Array.from(document.querySelectorAll(
+                'input[type="text"]:not([readonly]), textarea'
+            )).map(el => {
+                if (el.value && el.value.trim()) return null;
+                if (el.offsetParent === null) return null;
+                let label = '';
+                const container = el.closest('.field, [class*=field]');
+                if (container) {
+                    const lbl = container.querySelector('label');
+                    if (lbl) label = lbl.textContent.trim();
+                }
+                return {
+                    name: el.name || '',
+                    id: el.id || '',
+                    tag: el.tagName.toLowerCase(),
+                    label: label
+                };
+            }).filter(x => x !== null);
+        }''')
 
-                # Skip standard fields
-                field_id = container.get_attribute('id') or ''
-                if any(sid in field_id.lower() for sid in standard_ids):
-                    continue
-
-                # Check what type of input this is
-                text_input = container.query_selector('input[type="text"]:not([readonly])')
-                textarea = container.query_selector('textarea')
-                select_el = container.query_selector('select')
-                radio_buttons = container.query_selector_all('input[type="radio"]')
-                checkbox = container.query_selector('input[type="checkbox"]')
-
-                if select_el:
-                    self._handle_select_question(label, select_el)
-                elif radio_buttons:
-                    self._handle_radio_question(label, radio_buttons)
-                elif textarea:
-                    answer = self._answer_screening(label)
-                    textarea.fill(answer)
-                elif text_input:
-                    answer = self._answer_screening(label)
-                    text_input.fill(answer)
-                elif checkbox:
-                    # Usually consent checkboxes — check them
-                    try:
-                        checkbox.check()
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                logger.debug("Error handling question container: %s", e)
+        for f in fields:
+            name = f.get("name", "")
+            if name in standard_names:
                 continue
+
+            label = f.get("label", "")
+            if not label:
+                continue
+
+            selector = ""
+            if f.get("id"):
+                selector = f'#{f["id"]}'
+            elif name:
+                selector = f'[name="{name}"]'
+            else:
+                continue
+
+            try:
+                answer = self._answer_screening(label)
+                self._try_fill(selector, answer)
+            except Exception:
+                pass
+
+        # Checkboxes — check consent/agreement checkboxes
+        checkboxes = b.query_all('input[type="checkbox"]:not(:checked)')
+        for cb in checkboxes:
+            try:
+                label = cb.evaluate(
+                    'el => el.closest("label, .field, [class*=field]")?.textContent?.trim() || ""'
+                ).lower()
+                if any(kw in label for kw in ["agree", "consent", "acknowledge", "confirm"]):
+                    cb.check()
+            except Exception:
+                pass
 
     def _handle_select_question(self, label: str, select_el) -> None:
         """Handle a <select> dropdown question."""
