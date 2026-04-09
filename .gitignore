@@ -9,3 +9,8 @@ __pycache__/
 dist/
 *.egg-info/
 .claude/
+.uploads/
+resume_upload.pdf
+agent1/*.pdf
+agent1/*.txt
+!agent1/__init__.py
