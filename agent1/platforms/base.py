@@ -124,6 +124,62 @@ class PlatformApplicant(ABC):
             job_context=job_context,
         )
 
+    def _handle_email_verification(self, sender_hint: str = "", timeout: int = 60) -> str | None:
+        """Check Gmail for a verification code or link, enter it if found.
+
+        Args:
+            sender_hint: Partial sender email to filter by.
+            timeout: Max seconds to wait for the email.
+
+        Returns:
+            None if handled, or error string if failed.
+        """
+        try:
+            from agent1.email_client import get_gmail_client
+            client = get_gmail_client()
+
+            if not client.is_configured():
+                logger.info("Gmail not configured, skipping email verification")
+                return "failed:account_required"
+
+            # Try OTP code first
+            code = client.get_verification_code(
+                sender_hint=sender_hint, timeout=timeout, poll_interval=5,
+            )
+            if code:
+                # Find the code input field and fill it
+                b = self.b
+                code_field = (
+                    b.query('input[name*="code"]')
+                    or b.query('input[name*="otp"]')
+                    or b.query('input[name*="verify"]')
+                    or b.query('input[placeholder*="code" i]')
+                    or b.query('input[type="text"]')
+                )
+                if code_field:
+                    code_field.fill(code)
+                    self._try_click('button:has-text("Verify")')
+                    self._try_click('button:has-text("Confirm")')
+                    self._try_click('button[type="submit"]')
+                    import time as _time
+                    _time.sleep(3)
+                    return None
+
+            # Try verification link
+            link = client.get_verification_link(
+                sender_hint=sender_hint, timeout=30, poll_interval=5,
+            )
+            if link:
+                self.b.goto(link)
+                import time as _time
+                _time.sleep(3)
+                return None
+
+        except Exception as e:
+            logger.debug("Email verification error: %s", e)
+
+        return "failed:account_required"
+
     @property
     def first_name(self) -> str:
         full = self.personal.get("full_name", "")

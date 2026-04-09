@@ -225,6 +225,39 @@ def stats() -> None:
         console.print(site_table)
 
 
+@app.command(name="gmail-setup")
+def gmail_setup() -> None:
+    """Set up Gmail API access for email verification (OTP codes)."""
+    from agent1.email_client import GmailClient, CREDENTIALS_PATH, TOKEN_PATH
+
+    if not CREDENTIALS_PATH.exists():
+        console.print(
+            "[yellow]Gmail credentials not found.[/yellow]\n\n"
+            "To set up Gmail:\n"
+            "1. Go to [bold]https://console.cloud.google.com[/bold]\n"
+            "2. Create a project (or select existing)\n"
+            "3. Enable the Gmail API\n"
+            "4. Create OAuth 2.0 credentials (Desktop app)\n"
+            f"5. Download the JSON and save it as:\n   [cyan]{CREDENTIALS_PATH}[/cyan]\n"
+            "6. Run [bold]agent1 gmail-setup[/bold] again"
+        )
+        raise typer.Exit(code=1)
+
+    client = GmailClient()
+    if client.authenticate():
+        console.print(f"[green]Gmail authenticated![/green] Token saved to {TOKEN_PATH}")
+
+        # Quick test
+        emails = client.search_emails(max_results=1, max_age_minutes=60)
+        if emails:
+            console.print(f"[dim]Test: found {len(emails)} recent email(s). Gmail is working.[/dim]")
+        else:
+            console.print("[dim]Test: no recent emails found (that's ok, Gmail is connected).[/dim]")
+    else:
+        console.print("[red]Gmail authentication failed.[/red]")
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def apply(
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
