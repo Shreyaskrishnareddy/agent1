@@ -206,14 +206,12 @@ class Browser:
         Strategy:
         1. If Chrome CDP is already running on the port, connect to it.
         2. Else, try to launch Chrome with CDP and connect.
-        3. Else, fall back to Playwright's bundled Chromium.
+        3. Else, try Playwright's bundled Chromium (needs `playwright install`).
+        4. Else, give a helpful error message.
         """
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
-
-        viewport = config.DEFAULTS.get("viewport", "1280x900")
-        w, h = (int(x) for x in viewport.split("x"))
 
         # Strategy 1: Connect to already-running Chrome
         if self._cdp_is_ready():
@@ -240,29 +238,53 @@ class Browser:
                 )
                 return self
 
-            logger.warning("[worker-%d] Chrome launched but CDP not ready, trying bundled...", self.worker_id)
+            logger.warning("[worker-%d] Chrome found but CDP failed, trying bundled...", self.worker_id)
 
         # Strategy 3: Bundled Playwright Chromium
-        Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
-        self._context = self._pw.chromium.launch_persistent_context(
-            user_data_dir=self.user_data_dir,
-            headless=self.headless,
-            viewport={"width": w, "height": h},
-            args=[
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-popup-blocking",
-                "--deny-permission-prompts",
-                "--disable-notifications",
-            ],
-        )
-        if self._context.pages:
-            self._page = self._context.pages[0]
-        else:
-            self._page = self._context.new_page()
+        try:
+            Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
+            viewport = config.DEFAULTS.get("viewport", "1280x900")
+            w, h = (int(x) for x in viewport.split("x"))
+            self._context = self._pw.chromium.launch_persistent_context(
+                user_data_dir=self.user_data_dir,
+                headless=self.headless,
+                viewport={"width": w, "height": h},
+                args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-popup-blocking",
+                    "--deny-permission-prompts",
+                    "--disable-notifications",
+                ],
+            )
+            if self._context.pages:
+                self._page = self._context.pages[0]
+            else:
+                self._page = self._context.new_page()
 
-        logger.info("[worker-%d] Browser launched (bundled Chromium)", self.worker_id)
-        return self
+            logger.info("[worker-%d] Browser launched (bundled Chromium)", self.worker_id)
+            return self
+        except Exception as e:
+            logger.debug("Bundled Chromium failed: %s", e)
+
+        # All strategies failed
+        self._cleanup_pw()
+        raise RuntimeError(
+            "Could not connect to a browser.\n\n"
+            "Option 1 (recommended): Launch Chrome with remote debugging:\n"
+            f'  chrome --remote-debugging-port={self._cdp_port}\n\n'
+            "Option 2: Install Playwright's Chromium:\n"
+            "  playwright install --with-deps chromium\n"
+        )
+
+    def _cleanup_pw(self) -> None:
+        """Stop playwright without closing a browser."""
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
 
     @property
     def page(self):
