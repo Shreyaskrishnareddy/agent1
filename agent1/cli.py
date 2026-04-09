@@ -233,10 +233,76 @@ def apply(
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
+    skip_filter: bool = typer.Option(False, "--skip-filter", help="Skip pre-filter step."),
+    mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
+    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed."),
+    fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
+    reset_failed_flag: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
-    console.print("[yellow]Apply command not yet implemented. Coming in Phase 6.[/yellow]")
+
+    # --- Utility modes (no browser needed) ---
+    if mark_applied:
+        from agent1.apply.launcher import mark_job
+        mark_job(mark_applied, "applied")
+        console.print(f"[green]Marked as applied:[/green] {mark_applied}")
+        return
+
+    if mark_failed:
+        from agent1.apply.launcher import mark_job
+        mark_job(mark_failed, "failed", reason=fail_reason)
+        console.print(f"[yellow]Marked as failed:[/yellow] {mark_failed} ({fail_reason or 'manual'})")
+        return
+
+    if reset_failed_flag:
+        from agent1.apply.launcher import reset_failed
+        count = reset_failed()
+        console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
+        return
+
+    # --- Pre-flight checks ---
+    _preflight_checks()
+
+    from agent1.database import get_connection
+    from agent1.apply.launcher import main as apply_main
+
+    # Check jobs ready
+    if not url:
+        conn = get_connection()
+        ready = conn.execute(
+            "SELECT COUNT(*) FROM jobs "
+            "WHERE applied_at IS NULL "
+            "AND (apply_status IS NULL OR apply_status = 'failed')"
+        ).fetchone()[0]
+        if ready == 0:
+            console.print(
+                "[red]No jobs ready to apply.[/red]\n"
+                "Run [bold]agent1 load[/bold] or [bold]agent1 discover[/bold] first."
+            )
+            raise typer.Exit(code=1)
+
+    effective_limit = limit if limit is not None else (0 if continuous else 1)
+
+    console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
+    console.print(f"  Limit:      {'unlimited' if continuous else effective_limit}")
+    console.print(f"  Workers:    {workers}")
+    console.print(f"  Headless:   {headless}")
+    console.print(f"  Dry run:    {dry_run}")
+    console.print(f"  Pre-filter: {'off' if skip_filter else 'on'}")
+    if url:
+        console.print(f"  Target:     {url}")
+    console.print()
+
+    apply_main(
+        limit=effective_limit,
+        target_url=url,
+        headless=headless,
+        dry_run=dry_run,
+        continuous=continuous,
+        workers=workers,
+        skip_filter=skip_filter,
+    )
 
 
 @app.command()
@@ -246,14 +312,121 @@ def batch(
     auto: bool = typer.Option(False, "--auto", help="Auto-continue without prompting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    skip_filter: bool = typer.Option(False, "--skip-filter", help="Skip pre-filter step."),
+    run_discover: bool = typer.Option(False, "--discover", "-d", help="Run discover before applying."),
+    site: str = typer.Option("manual", help="Source site label for file import."),
+    strategy: str = typer.Option("batch_import", help="Strategy label for file import."),
 ) -> None:
-    """Batch-apply to jobs."""
+    """Batch-apply to jobs: load from file (optional), then process."""
+    import signal as _signal
+
     _bootstrap()
-    console.print("[yellow]Batch command not yet implemented. Coming in Phase 6.[/yellow]")
+    _preflight_checks()
+
+    from agent1.config import DEFAULTS
+    from agent1.database import get_connection, store_jobs
+    from agent1.apply.launcher import main as apply_main, reset_state, release_lock
+
+    if run_discover:
+        discover(
+            repo="jobright-ai/2026-Software-Engineer-New-Grad",
+            site="jobright", strategy="github_discover",
+            keep_utm=False, no_filter=False,
+            location=None, work_model=None,
+            limit=None, source="all",
+        )
+
+    conn = get_connection()
+    max_attempts = DEFAULTS["max_apply_attempts"]
+
+    # Load file if provided
+    if file:
+        if not file.exists():
+            console.print(f"[red]Error:[/red] File not found: {file}")
+            raise typer.Exit(code=1)
+
+        urls: list[str] = []
+        for line in file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("http://") or line.startswith("https://"):
+                urls.append(line)
+
+        if urls:
+            jobs = [{"url": u} for u in urls]
+            new_count, dup_count = store_jobs(conn, jobs, site, strategy)
+            console.print(
+                f"Loaded [green]{new_count}[/green] new jobs "
+                f"([yellow]{dup_count}[/yellow] duplicates skipped)"
+            )
+
+    # Count pending
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE applied_at IS NULL "
+        "  AND (apply_status IS NULL OR apply_status = 'failed') "
+        "  AND COALESCE(apply_attempts, 0) < ?",
+        [max_attempts],
+    ).fetchone()
+    pending = rows[0]
+
+    if not pending:
+        console.print("[yellow]No pending jobs to apply to.[/yellow]")
+        raise typer.Exit()
+
+    console.print(f"\n[bold blue]Batch Apply[/bold blue]")
+    console.print(f"  Jobs:       {pending}")
+    console.print(f"  Workers:    {workers}")
+    console.print(f"  Auto:       {auto}")
+    console.print(f"  Headless:   {headless}")
+    console.print(f"  Dry run:    {dry_run}")
+    console.print()
+
+    if auto:
+        apply_main(
+            limit=pending,
+            headless=headless,
+            dry_run=dry_run,
+            continuous=False,
+            workers=workers,
+            auto=True,
+            skip_filter=skip_filter,
+        )
+    else:
+        # Single-job mode with prompts between
+        applied = 0
+        failed = 0
+
+        for i in range(pending):
+            try:
+                reset_state()
+                apply_main(
+                    limit=1, headless=headless,
+                    dry_run=dry_run, continuous=False,
+                    workers=1, auto=True,
+                    skip_filter=skip_filter,
+                )
+            except KeyboardInterrupt:
+                break
+
+            # Reset signal for clean input
+            _signal.signal(_signal.SIGINT, _signal.default_int_handler)
+
+            remaining = pending - (i + 1)
+            if remaining > 0:
+                console.print(f"[dim]{remaining} job(s) remaining.[/dim]")
+                try:
+                    input("Press Enter for next job, Ctrl+C to exit... ")
+                except (KeyboardInterrupt, EOFError):
+                    console.print("\n[yellow]Stopped. Run again to continue.[/yellow]")
+                    break
+
+        console.print(f"\n[bold]Batch complete.[/bold]")
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap helper
+# Bootstrap & preflight
 # ---------------------------------------------------------------------------
 
 def _bootstrap() -> None:
@@ -263,3 +436,15 @@ def _bootstrap() -> None:
     load_env()
     ensure_dirs()
     init_db()
+
+
+def _preflight_checks() -> None:
+    """Verify profile exists before apply/batch commands."""
+    from agent1.config import PROFILE_PATH
+
+    if not PROFILE_PATH.exists():
+        console.print(
+            "[red]Profile not found.[/red]\n"
+            "Run [bold]agent1 init[/bold] to create your profile first."
+        )
+        raise typer.Exit(code=1)
